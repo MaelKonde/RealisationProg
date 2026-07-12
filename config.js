@@ -6,9 +6,21 @@
       ajoutés.
    ══════════════════════════════════════════════════════════════════════ */
 const APP_CONFIG = {
-  // Fichiers arxiv_<mois>.json disponibles à la racine du site, dans
-  // l'ordre chronologique. 🔌 Pour ajouter un mois : déposez le fichier
-  // arxiv_<mois>.json à la racine, puis ajoutez sa clé ici.
+    'arxiv_aout2025.json',
+    'arxiv_avril2025.json',
+    'arxiv_avril2026.json',
+    'arxiv_decembre2025.json',
+    'arxiv_fevrier2025.json',
+    'arxiv_fevrier2026.json',
+    'arxiv_janvier2026.json',
+    'arxiv_juillet2025.json',
+    'arxiv_juin2025.json',
+    'arxiv_juin2026.json',
+    'arxiv_mai2026.json',
+    'arxiv_mars2025.json',
+    'arxiv_mars2026.json',
+    'arxiv_novembre2025.json',
+   
   MONTHS_FILES: [
     'fevrier2025',
     'mars2025',
