@@ -566,9 +566,19 @@ function normalizeLocal(a) {
     pays: au['pays'] || au.pays || []
   }));
 
+  // Résolution du meilleur lien vers l'article :
+  // Priorité : url_arxiv (lien direct PDF) > doi > id OpenAlex (page de résumé)
+  const url_arxiv  = a['url_arxiv']      || null;
+  const doi        = a['doi']            || null;
+  const lien_direct = a['lien_direct']   || null;
+  const id_openalex = a["id de l'article"] || a.id || '';
+
   return {
     titre:      a['titre']          || a.titre || 'Sans titre',
-    id:         a["id de l'article"] || a.id   || '',
+    id:         id_openalex,
+    url_arxiv:  url_arxiv,
+    doi:        doi,
+    lien_direct: lien_direct || url_arxiv || doi || id_openalex,
     date:       a['date']            || a.date  || '',
     auteurs,
     langue:     a['language']       || a.langue || 'en',
@@ -749,9 +759,17 @@ function renderArticles() {
   document.getElementById('countLine').textContent = label;
 
   document.getElementById('articleList').innerHTML = RESULTS.map((a, i) => {
-    const link = a.id.startsWith('https://openalex.org/')
-      ? `https://arxiv.org/search/?searchtype=all&query=${encodeURIComponent(a.titre.slice(0,60))}`
-      : a.id || '#';
+    // ── Résolution des liens ─────────────────────────────────────────────
+    // url_arxiv   : lien direct arXiv (ex: https://arxiv.org/abs/2502.12345)
+    //               → disponible dans les NOUVEAUX JSON (script mis à jour)
+    // doi         : ex: https://doi.org/10.48550/arXiv.2502.12345
+    // id OpenAlex : https://openalex.org/W... (toujours présent, page résumé)
+    // arxivUrl    : recherche par titre (fallback si rien d'autre)
+    const openalexUrl = a.id && a.id.startsWith('https://openalex.org/') ? a.id : null;
+    const arxivUrl    = `https://arxiv.org/search/?searchtype=all&query=${encodeURIComponent(a.titre)}`;
+    // lien_direct = url_arxiv ou doi (champs des nouveaux JSON)
+    // Pour les anciens JSON (sans ces champs), on utilise OpenAlex en fallback
+    const link = a.lien_direct || a.url_arxiv || a.doi || openalexUrl || arxivUrl;
     const auteurs = a.auteurs.slice(0,5).map(au=>`<strong>${au.nom}</strong>`).join(', ')
                   + (a.auteurs.length>5 ? ` <em style="color:var(--text-3)">+${a.auteurs.length-5}</em>` : '');
     const paysUniq = [...new Set(a.pays)].slice(0,4).map(p =>
@@ -761,7 +779,21 @@ function renderArticles() {
 
     return `<div class="article-card">
       <div class="card-top">
-        <div class="article-title"><a href="${link}" target="_blank" rel="noopener">${a.titre}</a></div>
+        <div class="article-title">
+          <a href="${link}" target="_blank" rel="noopener" title="Voir sur OpenAlex">${a.titre}</a>
+        </div>
+        <div style="display:flex;gap:8px;margin-bottom:6px;flex-wrap:wrap;">
+          <a href="${openalexUrl || '#'}" target="_blank" rel="noopener"
+            style="font-size:11px;padding:3px 10px;border-radius:99px;font-weight:500;background:rgba(42,107,107,.07);color:var(--teal);border:1px solid rgba(42,107,107,.2);text-decoration:none;"
+            title="Page OpenAlex : résumé, citations, liens PDF">
+            🔗 OpenAlex
+          </a>
+          <a href="${arxivUrl}" target="_blank" rel="noopener"
+            style="font-size:11px;padding:3px 10px;border-radius:99px;font-weight:500;background:rgba(139,58,42,.06);color:var(--rust);border:1px solid rgba(139,58,42,.2);text-decoration:none;"
+            title="Rechercher sur arXiv">
+            📄 arXiv
+          </a>
+        </div>
         ${a.openAccess ? '<span class="meta-pill" style="flex-shrink:0;background:rgba(42,107,107,.07);color:var(--teal);border-color:rgba(42,107,107,.2);">Open Access</span>' : ''}
       </div>
       <div class="article-authors">${auteurs || '<em style="color:var(--text-3)">Auteurs non renseignés</em>'}</div>
