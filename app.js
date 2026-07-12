@@ -1,0 +1,739 @@
+/* ══════════════════════════════════════════════════════════════════════
+   LOGIQUE APPLICATIVE — Tendances Scientifiques
+   ══════════════════════════════════════════════════════════════════════
+   Dépend de : config.js (APP_CONFIG) et data.js (CENTROIDS, PAYS_INFO,
+   STOPWORDS, TD_FALLBACK). Ces deux fichiers doivent être chargés AVANT
+   celui-ci dans index.html.
+   ══════════════════════════════════════════════════════════════════════ */
+
+/* ══════════════════════════════════════════════════════════════════════
+   CHARGEMENT DES DONNÉES — source pilotée par APP_CONFIG (config.js)
+   ══════════════════════════════════════════════════════════════════════
+   Le tableau TD (monthly_kw, country_kw, monthly_vol, articles_sample,
+   month_labels) n'est plus codé en dur : il est reconstruit au chargement
+   de la page à partir des fichiers arxiv_<mois>.json listés dans
+   APP_CONFIG.MONTHS_FILES (ou depuis l'API si DATA_SOURCE = 'backend').
+
+   Chaque fichier arxiv_<mois>.json doit contenir un tableau d'articles
+   au format OpenAlex simplifié :
+   [{
+     "titre": "...",
+     "id de l'article": "https://openalex.org/...",
+     "date": "2025-02-28",
+     "auteurs": [{"nom":"...", "pays":["FR","US"]}],
+     "language": "en",
+     "Nombre de citations": 5,
+     "index_inverse_compte": {"mot": 3, ...}
+   }, ...]
+
+   ⚠ Approximation : monthly_kw / country_kw sont ici recalculés côté
+   client par simple somme des occurrences de mots (filtrées par
+   STOPWORDS), ce qui est une approximation raisonnable mais plus simple
+   que la pondération d'origine calculée côté serveur. Quand la BDD/API
+   sera prête (passer APP_CONFIG.DATA_SOURCE à 'backend'), le vrai calcul
+   pondéré pourra être fait côté serveur et servi tel quel.
+   ══════════════════════════════════════════════════════════════════════ */
+let TD           = null;
+let MONTH_ORDER  = [];
+let ML           = {};
+let MV           = {};
+
+async function fetchMonthArticles(mois) {
+  if (APP_CONFIG.DATA_SOURCE === 'backend') {
+    // 🔌 BRANCHEMENT BDD : adapter l'URL/les paramètres à l'API réelle
+    const r = await fetch(`${APP_CONFIG.BACKEND_API_URL}/articles?mois=${mois}`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return r.json();
+  }
+  // Mode JSON local (par défaut) : fichier à la racine du site
+  const r = await fetch(`arxiv_${mois}.json`);
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+}
+
+function normalizeArticle(raw, mois) {
+  const kwRaw = raw['index_inverse_compte'] || raw.index_inverse_compte || {};
+  const kwFiltered = Object.entries(kwRaw)
+    .filter(([w]) => !STOPWORDS.has(w.toLowerCase()) && w.length > 3)
+    .sort((a, b) => b[1] - a[1]);
+
+  const auteurs = (raw['auteurs'] || raw.auteurs || []).map(au => ({
+    nom:  au['nom']  || au.nom  || '?',
+    pays: au['pays'] || au.pays || [],
+  }));
+  const pays = [...new Set(auteurs.flatMap(au => au.pays).filter(Boolean))];
+
+  return {
+    titre:      raw['titre'] || raw.titre || 'Sans titre',
+    id:         raw["id de l'article"] || raw.id || '',
+    date:       raw['date']  || raw.date  || '',
+    mois,
+    auteurs,
+    langue:     raw['language'] || raw.langue || 'en',
+    citations:  raw['Nombre de citations'] ?? raw.citations ?? 0,
+    mots_cles:  kwFiltered.slice(0, 10).map(([w]) => w),
+    pays,
+    _kw:        kwFiltered, // usage interne pour l'agrégation (retiré ensuite)
+  };
+}
+
+function formatMonthLabel(mois) {
+  const m = mois.match(/^([a-zéû]+)(\d{4})$/i);
+  if (!m) return mois;
+  const ABBR = {
+    janvier:'Janv', fevrier:'Fév', mars:'Mars', avril:'Avr', mai:'Mai',
+    juin:'Juin', juillet:'Juil', aout:'Août', septembre:'Sept',
+    octobre:'Oct', novembre:'Nov', decembre:'Déc',
+  };
+  const name = m[1].toLowerCase();
+  return `${ABBR[name] || m[1]} ${m[2]}`;
+}
+
+async function buildTD() {
+  const monthly_kw   = {};
+  const country_kw   = {};
+  const monthly_vol  = {};
+  const month_labels = {};
+  let allArticles    = [];
+  let anySuccess      = false;
+
+  for (const mois of APP_CONFIG.MONTHS_FILES) {
+    month_labels[mois] = formatMonthLabel(mois);
+    try {
+      const raw = await fetchMonthArticles(mois);
+      const articles = raw.map(a => normalizeArticle(a, mois));
+      monthly_vol[mois] = articles.length;
+
+      const kwAgg = {};
+      articles.forEach(a => {
+        a._kw.forEach(([w, c]) => { kwAgg[w] = (kwAgg[w] || 0) + c; });
+        a.pays.forEach(p => {
+          country_kw[p] = country_kw[p] || {};
+          a._kw.forEach(([w, c]) => { country_kw[p][w] = (country_kw[p][w] || 0) + c; });
+        });
+        delete a._kw;
+      });
+      monthly_kw[mois] = kwAgg;
+      allArticles = allArticles.concat(articles);
+      anySuccess = true;
+    } catch (e) {
+      console.warn(`⚠ arxiv_${mois}.json introuvable ou invalide —`, e.message);
+      monthly_vol[mois] = 0;
+      monthly_kw[mois]  = {};
+    }
+  }
+
+  if (!anySuccess) {
+    // Aucun fichier JSON accessible (serveur local non lancé, fichiers absents…)
+    // → on retombe sur le jeu de données de démonstration.
+    return TD_FALLBACK;
+  }
+
+  allArticles.sort((a, b) => b.citations - a.citations);
+  const articles_sample = allArticles.slice(0, 400);
+
+  return { monthly_kw, country_kw, monthly_vol, articles_sample, month_labels };
+}
+
+/* État */
+let ACTIVE_MONTH   = null;
+let ACTIVE_COUNTRY = 'US';
+let EVO_WORD       = null;
+let CURRENT_TAB    = 'tendances';
+
+/* Particules */
+(function(){
+  const c=document.getElementById('starCanvas');if(!c)return;
+  const ctx=c.getContext('2d');let P=[],W,H;
+  function resize(){W=c.width=c.offsetWidth;H=c.height=c.offsetHeight;
+    P=Array.from({length:30},()=>({x:Math.random()*W,y:Math.random()*H,
+      r:Math.random()*1.2+.3,vx:(Math.random()-.5)*.12,vy:(Math.random()-.5)*.08,
+      alpha:Math.random()*.28+.08,phase:Math.random()*Math.PI*2,speed:Math.random()*.012+.004}));}
+  function draw(){ctx.clearRect(0,0,W,H);
+    P.forEach(s=>{s.phase+=s.speed;s.x+=s.vx;s.y+=s.vy;
+      if(s.x<0)s.x=W;if(s.x>W)s.x=0;if(s.y<0)s.y=H;if(s.y>H)s.y=0;
+      const a=s.alpha*(.55+.45*Math.sin(s.phase));
+      ctx.beginPath();ctx.arc(s.x,s.y,s.r,0,Math.PI*2);
+      ctx.fillStyle=`rgba(180,140,60,${a})`;ctx.fill();});
+    requestAnimationFrame(draw);}
+  window.addEventListener('resize',resize);resize();draw();
+})();
+window.addEventListener('scroll',()=>{
+  document.getElementById('header').classList.toggle('scrolled',window.scrollY>10);
+},{passive:true});
+
+/* Scroll reveal */
+const revObs=new IntersectionObserver(entries=>{
+  entries.forEach((e,i)=>{if(e.isIntersecting){
+    e.target.style.animationDelay=(i*50)+'ms';
+    e.target.classList.add('visible');revObs.unobserve(e.target);}});
+},{threshold:.07});
+
+/* Toast */
+function toast(msg,d=2400){const t=document.getElementById('toast');
+  t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),d);}
+
+/* Compteur animé */
+function animCount(el,v,d=650){const s=performance.now();
+  (function step(n){const p=Math.min((n-s)/d,1);
+    el.textContent=Math.round(v*(1-Math.pow(1-p,3))).toLocaleString('fr-FR');
+    if(p<1)requestAnimationFrame(step);})(performance.now());}
+
+/* Animer barres */
+function animBars(){setTimeout(()=>{
+  document.querySelectorAll('.bar-fill').forEach(el=>{
+    requestAnimationFrame(()=>el.style.width=el.dataset.w+'%');});},60);}
+
+/* ══ Navigation (single page — no tabs) ════════════════════════════════ */
+function showTab(name,btn){
+  // Single page — all sections visible, no-op for old calls
+}
+
+/* ══ Stat strip ════════════════════════════════════════════════════════ */
+function renderStatStrip(){
+  const totalArts=Object.values(MV).reduce((s,v)=>s+v,0);
+  const topKW=Object.entries(TD.monthly_kw[ACTIVE_MONTH]||{}).sort((a,b)=>b[1]-a[1])[0]?.[0]||'—';
+  const topCountry=Object.keys(TD.country_kw)[0]||'—';
+  document.getElementById('statStrip').innerHTML=`
+    <div class="stat-card"><div class="stat-label">Articles collectés</div>
+      <div class="stat-val g" id="sc-tot">0</div><div class="stat-note">arXiv via OpenAlex</div></div>
+    <div class="stat-card"><div class="stat-label">Mois couverts</div>
+      <div class="stat-val">${MONTH_ORDER.length}</div><div class="stat-note">fév 2025 → mai 2026</div></div>
+    <div class="stat-card"><div class="stat-label">Pays avec données</div>
+      <div class="stat-val">${Object.keys(TD.country_kw).length}</div></div>
+    <div class="stat-card"><div class="stat-label">Mot top (${ML[ACTIVE_MONTH]||''})</div>
+      <div class="stat-val" style="font-size:1rem;padding-top:3px;font-style:italic;">${topKW}</div></div>
+  `;
+  setTimeout(()=>animCount(document.getElementById('sc-tot'),totalArts),80);
+}
+
+/* ══ Cloud ═════════════════════════════════════════════════════════════ */
+function renderCloud(mois){
+  const wrap=document.getElementById('cloudMain');
+  wrap.classList.add('fading');
+  setTimeout(()=>{
+    const data=TD.monthly_kw[mois]||{};
+    const sorted=Object.entries(data).sort((a,b)=>b[1]-a[1]).slice(0,55);
+    if(!sorted.length){wrap.innerHTML='<p style="color:var(--text-3);font-size:13px;">Aucune donnée.</p>';wrap.classList.remove('fading');return;}
+    const maxF=sorted[0][1];
+    wrap.innerHTML=sorted.map(([w,f])=>{
+      const size=11+Math.round((f/maxF)*20);
+      const op=(.38+(f/maxF)*.62).toFixed(2);
+      const isEvo=w===EVO_WORD;
+      return `<span class="cloud-word${isEvo?' selected':''}" style="font-size:${size}px;opacity:${op}"
+        onclick="onCloudClick('${w}')" title="${w}: score ${Math.round(f)}">${w}</span>`;
+    }).join('');
+    wrap.classList.remove('fading');
+  },180);
+}
+
+function onCloudClick(word){
+  EVO_WORD=word;
+  document.querySelectorAll('.cloud-word').forEach(el=>{
+    el.classList.toggle('selected',el.textContent===word);
+  });
+  traceEvolution(word);
+  document.getElementById('evoInput').value=word;
+  renderTopArticles(word);
+  // Scroll smooth vers les articles
+  setTimeout(()=>{
+    const el=document.getElementById('topArticlesList');
+    if(el) el.closest('.section-card').scrollIntoView({behavior:'smooth',block:'start'});
+  },200);
+  toast(`Évolution de "${word}" tracée — onglet Évolution`);
+}
+
+/* ══ Month pills ════════════════════════════════════════════════════════ */
+function initMonthPills(){
+  const c=document.getElementById('monthPills');
+  MONTH_ORDER.forEach(m=>{
+    const b=document.createElement('button');
+    b.className='m-pill'+(m===ACTIVE_MONTH?' active':'');
+    b.textContent=ML[m]||m;
+    b.onclick=()=>{
+      ACTIVE_MONTH=m;
+      document.querySelectorAll('.m-pill').forEach(x=>x.classList.remove('active'));
+      b.classList.add('active');
+      renderCloud(m);
+      renderStatStrip();
+      if(EVO_WORD) traceEvolution(EVO_WORD);
+    };
+    c.appendChild(b);
+  });
+}
+
+/* ══ Comparaison mois ══════════════════════════════════════════════════ */
+function renderCompare(){ /* single page — removed */ }
+
+/* ══ CARTE DU MONDE D3 ══════════════════════════════════════════════════ */
+let mapInitialized = false;
+let mapProjection, mapPath, mapSvg, mapG, mapZoom;
+
+// Correspondance code ISO A2 → numeric (subset des pays avec données)
+const ISO_A2_MAP = {
+  'US':'840','FR':'250','CN':'156','DE':'276','GB':'826','JP':'392',
+  'ES':'724','IT':'380','IN':'356','CH':'756','NL':'528','CA':'124',
+  'KR':'410','AU':'036','RU':'643','HK':'344','SE':'752','PL':'616',
+  'AT':'040','CZ':'203','BE':'056','DK':'208','FI':'246','NO':'578',
+  'PT':'620','IE':'372','IL':'376','SG':'702','TW':'158','BR':'076',
+  'MX':'484','AR':'032','ZA':'710','SA':'682','TR':'792','GR':'300',
+};
+// Reverse map numeric → A2
+const NUM_TO_A2 = Object.fromEntries(Object.entries(ISO_A2_MAP).map(([a2,num])=>[num,a2]));
+
+function renderMap(){
+  if(mapInitialized){ updateMapBubbles(); return; }
+  mapInitialized = true;
+
+  const container = document.getElementById('mapContainer');
+  const W = container.clientWidth || 700;
+  const H = Math.round(W * 0.52);
+
+  const svg = d3.select('#worldMapSvg')
+    .attr('viewBox', `0 0 ${W} ${H}`)
+    .attr('width', W).attr('height', H);
+
+  // Projection Mercator naturelle
+  mapProjection = d3.geoNaturalEarth1()
+    .scale(W / 6.5)
+    .translate([W/2, H/2]);
+  mapPath = d3.geoPath().projection(mapProjection);
+
+  // Zoom & pan
+  mapZoom = d3.zoom()
+    .scaleExtent([1, 8])
+    .on('zoom', (event) => mapG.attr('transform', event.transform));
+  svg.call(mapZoom);
+
+  mapG = svg.append('g');
+
+  // Fond ocean
+  mapG.append('rect')
+    .attr('width', W).attr('height', H)
+    .attr('fill', '#c8e6f5');
+
+  // Graticules
+  const graticule = d3.geoGraticule().step([20,20]);
+  mapG.append('path')
+    .datum(graticule())
+    .attr('d', mapPath)
+    .attr('fill','none')
+    .attr('stroke','rgba(255,255,255,.25)')
+    .attr('stroke-width',.3);
+
+  // Charger les données géographiques via CDN
+  d3.json('https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json').then(world => {
+    const countries = topojson.feature(world, world.objects.countries);
+
+    // Volume par pays
+    const countryVol = {};
+    Object.entries(TD.country_kw).forEach(([code,kws]) => {
+      countryVol[code] = Object.values(kws).reduce((s,v)=>s+v, 0);
+    });
+    const maxVol = Math.max(...Object.values(countryVol), 1);
+
+    // Échelle de couleur (parchment → or → rouille)
+    const colorScale = d3.scaleSequential()
+      .domain([0, maxVol])
+      .interpolator(d3.interpolate('#e8dcc8', '#c9963a'));
+
+    // Dessiner les pays
+    mapG.selectAll('.country')
+      .data(countries.features)
+      .join('path')
+      .attr('class', d => {
+        const a2 = NUM_TO_A2[String(d.id)];
+        const hasData = a2 && TD.country_kw[a2];
+        return 'country' + (hasData ? ' has-data' : '');
+      })
+      .attr('d', mapPath)
+      .attr('fill', d => {
+        const a2 = NUM_TO_A2[String(d.id)];
+        if(!a2 || !countryVol[a2]) return '#e8dcc8';
+        return colorScale(countryVol[a2]);
+      })
+      .attr('stroke','#c0aa88').attr('stroke-width',.3)
+      .on('click', (event, d) => {
+        const a2 = NUM_TO_A2[String(d.id)];
+        if(a2 && TD.country_kw[a2]) selectCountry(a2, event);
+      })
+      .on('mouseover', (event, d) => {
+        const a2 = NUM_TO_A2[String(d.id)];
+        if(!a2 || !TD.country_kw[a2]) return;
+        showMapTooltip(event, a2);
+      })
+      .on('mousemove', (event) => moveMapTooltip(event))
+      .on('mouseleave', () => hideMapTooltip());
+
+    // Frontières
+    mapG.append('path')
+      .datum(topojson.mesh(world, world.objects.countries, (a,b)=>a!==b))
+      .attr('d', mapPath)
+      .attr('fill','none')
+      .attr('stroke','rgba(255,255,255,.55)')
+      .attr('stroke-width',.4);
+
+    // Bulles
+    updateMapBubbles();
+  }).catch(err => {
+    console.error('Erreur chargement carte:', err);
+    document.getElementById('sidebarTitle').textContent = 'Erreur chargement carte';
+  });
+}
+
+function updateMapBubbles(){
+  if(!mapG) return;
+  mapG.selectAll('.bubble-group').remove();
+
+  const countryVol = {};
+  Object.entries(TD.country_kw).forEach(([code,kws]) => {
+    countryVol[code] = Object.values(kws).reduce((s,v)=>s+v, 0);
+  });
+  const maxVol = Math.max(...Object.values(countryVol), 1);
+
+  const bubbleData = Object.entries(CENTROIDS)
+    .filter(([code]) => TD.country_kw[code])
+    .map(([code,[lon,lat]]) => ({
+      code, lon, lat,
+      vol: countryVol[code]||0,
+      xy: mapProjection([lon, lat])
+    }))
+    .filter(d => d.xy);
+
+  const rScale = d3.scaleSqrt().domain([0, maxVol]).range([4, 28]);
+
+  const groups = mapG.selectAll('.bubble-group')
+    .data(bubbleData, d=>d.code)
+    .join('g')
+    .attr('class','bubble-group')
+    .style('cursor','pointer');
+
+  groups.append('circle')
+    .attr('class','bubble')
+    .attr('cx', d => d.xy[0])
+    .attr('cy', d => d.xy[1])
+    .attr('r', 0)
+    .attr('fill', d => d.code===ACTIVE_COUNTRY
+      ? 'rgba(201,150,58,.9)' : 'rgba(139,58,42,.72)')
+    .attr('stroke','rgba(255,255,255,.7)')
+    .attr('stroke-width',1.2)
+    .transition().duration(600).ease(d3.easeCubicOut)
+    .attr('r', d => rScale(d.vol));
+
+  groups.append('text')
+    .attr('class','bubble-label')
+    .attr('x', d=>d.xy[0]).attr('y', d=>d.xy[1])
+    .text(d => rScale(d.vol) > 13 ? d.code : '')
+    .attr('font-size', d => rScale(d.vol) > 18 ? '8' : '6')
+    .attr('fill','#fff').attr('text-anchor','middle')
+    .attr('dominant-baseline','central')
+    .attr('pointer-events','none');
+
+  groups
+    .on('mouseover', (event, d) => showMapTooltip(event, d.code))
+    .on('mousemove', (event) => moveMapTooltip(event))
+    .on('mouseleave', () => hideMapTooltip())
+    .on('click', (event, d) => selectCountry(d.code, event));
+}
+
+function showMapTooltip(event, code){
+  const info = PAYS_INFO[code]||{label:code,flag:'🌐'};
+  const kws  = TD.country_kw[code]||{};
+  const top3 = Object.entries(kws).sort((a,b)=>b[1]-a[1]).slice(0,4).map(([w])=>w);
+  const tt   = document.getElementById('mapTooltip');
+  tt.innerHTML = `<div class="tt-country">${info.flag} ${info.label}</div>
+    <div class="tt-kw">🔑 ${top3.join(' &nbsp;·&nbsp; ')}</div>`;
+  moveMapTooltip(event);
+  tt.classList.add('show');
+}
+function moveMapTooltip(event){
+  const rect = document.getElementById('mapContainer').getBoundingClientRect();
+  const tt   = document.getElementById('mapTooltip');
+  let x = event.clientX - rect.left + 14;
+  let y = event.clientY - rect.top  - 10;
+  if(x + 220 > rect.width)  x -= 240;
+  if(y + 80  > rect.height) y -= 90;
+  tt.style.left = x + 'px';
+  tt.style.top  = y + 'px';
+}
+function hideMapTooltip(){
+  document.getElementById('mapTooltip').classList.remove('show');
+}
+
+function selectCountry(code, event){
+  if(event) event.stopPropagation();
+  ACTIVE_COUNTRY = code;
+  const info = PAYS_INFO[code]||{label:code,flag:'🌐'};
+  const kws  = TD.country_kw[code]||{};
+  const sorted = Object.entries(kws).sort((a,b)=>b[1]-a[1]).slice(0,14);
+  const maxV   = sorted[0]?.[1]||1;
+
+  document.getElementById('sidebarTitle').textContent = `${info.flag} ${info.label}`;
+  document.getElementById('sidebarBars').innerHTML = sorted.map(([w,v])=>`
+    <div class="bar-row">
+      <span class="bar-label" title="${w}">${w}</span>
+      <div class="bar-track"><div class="bar-fill" style="background:var(--teal)" data-w="${Math.round(v/maxV*100)}"></div></div>
+      <span class="bar-count">${Math.round(v)}</span>
+    </div>`).join('');
+  animBars();
+
+  // Highlight on map
+  if(mapG){
+    mapG.selectAll('.bubble').attr('fill', d =>
+      d.code===code ? 'rgba(201,150,58,.9)' : 'rgba(139,58,42,.72)');
+    mapG.selectAll('.country').classed('active', d => NUM_TO_A2[String(d.id)]===code);
+  }
+  toast(`${info.flag} ${info.label} — ${sorted.length} mots-clés`);
+}
+
+function resetMapZoom(){
+  // mapZoom est initialisé dans renderMap()
+  if(mapZoom){
+    d3.select('#worldMapSvg')
+      .transition().duration(600)
+      .call(mapZoom.transform, d3.zoomIdentity);
+  }
+}
+
+/* ══ ÉVOLUTION ══════════════════════════════════════════════════════════ */
+function traceEvolution(word){
+  if(!word) return;
+  EVO_WORD=word.toLowerCase().trim();
+  document.getElementById('evoInput').value=EVO_WORD;
+
+  const vals=MONTH_ORDER.map(m=>{
+    const kws=TD.monthly_kw[m]||{};
+    return kws[EVO_WORD]||0;
+  });
+  const maxV=Math.max(...vals,1);
+  const hasData=vals.some(v=>v>0);
+
+  document.getElementById('evoLabel').innerHTML=hasData
+    ?`Évolution de <strong style="color:var(--gold)">"${EVO_WORD}"</strong> sur ${MONTH_ORDER.length} mois`
+    :`<span style="color:var(--rust)">Mot "<strong>${EVO_WORD}</strong>" non trouvé dans les données.</span>`;
+
+  document.getElementById('evoChart').innerHTML=MONTH_ORDER.map((m,i)=>{
+    const h=Math.max(4,Math.round((vals[i]/maxV)*100));
+    const isActive=m===ACTIVE_MONTH;
+    return `<div class="tl-col${isActive?' hi':''}" onclick="setMonth('${m}',${i})">
+      <div class="tl-val" style="font-size:9px;color:var(--text-3);">${vals[i]>0?Math.round(vals[i]):'—'}</div>
+      <div class="tl-bar" style="height:${h}px;${vals[i]>0?'background:var(--gold)':''}"></div>
+      <div class="tl-lbl">${(ML[m]||m).slice(0,7)}</div>
+    </div>`;
+  }).join('');
+
+  document.getElementById('evoNote').textContent=hasData
+    ?`Score = fréquence cumulée du mot dans les abstracts du mois (index inversé OpenAlex)`
+    :"Ce mot n'apparaît pas dans les mois disponibles. Essayez un synonyme.";
+
+  renderMultiEvo();
+}
+
+function setMonth(m,i){
+  ACTIVE_MONTH=m;
+  document.querySelectorAll('.m-pill').forEach((b,j)=>b.classList.toggle('active',j===i));
+  renderCloud(m);renderStatStrip();
+  if(EVO_WORD) traceEvolution(EVO_WORD);
+}
+
+function renderEvoSuggestions(){
+  // Top mots globaux toutes données confondues
+  const global={};
+  MONTH_ORDER.forEach(m=>{Object.entries(TD.monthly_kw[m]||{}).forEach(([w,v])=>{global[w]=(global[w]||0)+v;});});
+  const top=Object.entries(global).sort((a,b)=>b[1]-a[1]).slice(0,20).map(([w])=>w);
+  document.getElementById('evoSuggestions').innerHTML=
+    `<span style="font-size:12px;color:var(--text-3);margin-right:4px;">Suggestions :</span>`+
+    top.map(w=>`<span class="kw-tag" onclick="traceEvolution('${w}')">${w}</span>`).join('');
+}
+
+function renderMultiEvo(){ /* single page — removed */ }
+
+/* ══ ARTICLES ═══════════════════════════════════════════════════════════ */
+async function renderTopArticles(keyword){
+  // ── Mode API (quand API_MODE = true) ────────────────────────────────
+  if(API_MODE){
+    try {
+      const sub = document.getElementById('articlesSub');
+      if(sub) sub.textContent = 'Chargement depuis la base de données…';
+      const arts = await fetchArticlesFromAPI(keyword);
+      CURRENT_ARTICLES = arts;
+      displayArticles(arts, keyword);
+      updateArticlesHeader(keyword, arts.length);
+    } catch(err){
+      const sub = document.getElementById('articlesSub');
+      if(sub) sub.innerHTML = `<span style="color:var(--rust);">Erreur API : ${err.message} — passage en mode local</span>`;
+      // Fallback sur données locales
+      renderTopArticlesLocal(keyword);
+    }
+    return;
+  }
+  // ── Mode local (données JSON précalculées) ───────────────────────────
+  renderTopArticlesLocal(keyword);
+}
+
+function renderTopArticlesLocal(keyword){
+  let arts = TD.articles_sample || [];
+  if(keyword){
+    const kw = keyword.toLowerCase();
+    arts = arts.filter(a =>
+      (a.mots_cles||[]).some(k => k.toLowerCase().includes(kw)) ||
+      (a.titre||'').toLowerCase().includes(kw)
+    );
+  }
+  arts = arts.sort((a,b)=>b.citations-a.citations).slice(0,20);
+  CURRENT_ARTICLES = arts;
+  updateArticlesHeader(keyword, arts.length);
+  displayArticles(arts, keyword);
+}
+
+function updateArticlesHeader(keyword, count){
+  const sub = document.getElementById('articlesSub');
+  const btn = document.getElementById('resetArticlesBtn');
+  if(keyword){
+    if(sub) sub.innerHTML = `Articles contenant <strong style="color:var(--gold)">"${keyword}"</strong> · ${count} résultat${count!==1?'s':''}`;
+    if(btn) btn.style.display = 'inline-block';
+  } else {
+    if(sub) sub.textContent = 'Sélection des articles à fort impact · cliquez sur un mot du nuage pour filtrer';
+    if(btn) btn.style.display = 'none';
+  }
+}
+
+function displayArticles(arts, keyword){
+  if(!arts.length){
+    document.getElementById('topArticlesList').innerHTML=
+      `<div style="padding:2rem;text-align:center;color:var(--text-3);font-size:14px;">
+        <div style="font-size:32px;opacity:.35;margin-bottom:10px;">🔍</div>
+        Aucun article trouvé${keyword ? ` pour <strong>"${keyword}"</strong>` : ''} dans les données chargées.
+        <div style="margin-top:8px;font-size:12px;">Essayez un autre mot du nuage.</div>
+      </div>`;
+    return;
+  }
+  document.getElementById('topArticlesList').innerHTML = arts.map((a,i) => {
+    const oa = a.id && a.id.startsWith('https://openalex.org/') ? a.id : null;
+    const ax = `https://arxiv.org/search/?searchtype=all&query=${encodeURIComponent(a.titre)}`;
+    const auths = (a.auteurs||[]).slice(0,3).map(au=>`<strong>${au.nom||'?'}</strong>`).join(', ');
+    const pays  = (a.pays||[]).slice(0,3).map(p=>`<span class="meta-pill">${PAYS_INFO[p]?PAYS_INFO[p].flag+' '+p:p}</span>`).join('');
+    return `<div class="article-card">
+      <div class="article-title"><a href="${oa||ax}" target="_blank" rel="noopener">${a.titre}</a></div>
+      <div class="article-authors">${auths}</div>
+      <div class="meta-row">
+        <span class="meta-pill date">📅 ${(a.date||'').slice(0,7)}</span>
+        ${a.citations>0?`<span class="meta-pill cit">⭐ ${a.citations} citations</span>`:''}
+        ${pays}
+      </div>
+      <div class="link-row">
+        ${oa?`<a class="link-btn oa" href="${oa}" target="_blank" rel="noopener">🔗 OpenAlex</a>`:''}
+        <a class="link-btn ax" href="${ax}" target="_blank" rel="noopener">📄 arXiv</a>
+      </div>
+      ${(a.mots_cles||[]).length?`<div class="kw-row">${a.mots_cles.map(kw=>{
+        const isMatch = keyword && kw.toLowerCase().includes(keyword.toLowerCase());
+        return `<span class="kw-tag" style="${isMatch?'background:var(--gold);color:#fff;border-color:var(--gold);':''}" onclick="onCloudClick('${kw}')">${kw}</span>`;
+      }).join('')}</div>`:''}
+    </div>`;
+  }).join('');
+  setTimeout(()=>document.querySelectorAll('.article-card:not(.visible)').forEach(el=>revObs.observe(el)),50);
+}
+
+
+function resetArticles(){
+  EVO_WORD = null;
+  document.querySelectorAll('.cloud-word').forEach(el=>el.classList.remove('selected'));
+  document.getElementById('resetArticlesBtn').style.display='none';
+  renderTopArticles();
+}
+
+/* ══ Export CSV des articles ═══════════════════════════════════════════ */
+let CURRENT_ARTICLES = []; // articles actuellement affichés — mis à jour par renderTopArticles
+
+function exportArticlesCSV(){
+  if(!CURRENT_ARTICLES.length){
+    showToast('Aucun article à exporter');
+    return;
+  }
+  const headers = ['Titre','Date','Mois','Auteurs','Pays','Citations','Mots-clés','URL OpenAlex','URL arXiv'];
+  const rows = CURRENT_ARTICLES.map(a => [
+    `"${(a.titre||'').replace(/"/g,'""')}"`,
+    a.date || '',
+    a.mois  || '',
+    `"${(a.auteurs||[]).map(au=>au.nom||'?').join(';')}"`,
+    `"${(a.pays||[]).join(';')}"`,
+    a.citations || 0,
+    `"${(a.mots_cles||[]).join(';')}"`,
+    a.id || '',
+    `"https://arxiv.org/search/?searchtype=all&query=${encodeURIComponent(a.titre)}"`,
+  ]);
+  const csv = [headers, ...rows].map(r => r.join(',')).join('\n');
+  const blob = new Blob(['\uFEFF' + csv], {type:'text/csv;charset=utf-8;'});
+  const url  = URL.createObjectURL(blob);
+  const el   = document.createElement('a');
+  el.href = url;
+  el.download = `articles_${EVO_WORD ? EVO_WORD + '_' : ''}${new Date().toISOString().slice(0,10)}.csv`;
+  el.click();
+  URL.revokeObjectURL(url);
+  showToast(`✓ ${CURRENT_ARTICLES.length} articles exportés en CSV`);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   🔌 BRANCHEMENT BDD / API — RECHERCHE EN LIVE
+   ══════════════════════════════════════════════════════════════════════════
+   Quand la BDD SQLite de Matthieu sera prête et l'API Flask de Paloma déployée,
+   remplacer les données statiques TD.articles_sample par des appels dynamiques.
+
+   ÉTAPE 1 — Activer le mode API en changeant cette constante :
+   ─────────────────────────────────────────────────────────────────────── */
+const API_MODE = false;  // ← passer à true quand l'API Flask est prête
+const API_BASE = 'http://localhost:5000'; // ← URL de votre API (local ou Render)
+
+/* ─────────────────────────────────────────────────────────────────────────
+   ÉTAPE 2 — Cette fonction remplace le filtre JS statique par un vrai appel API.
+   Elle est appelée depuis renderTopArticles() quand API_MODE = true.
+
+   L'API doit renvoyer :
+   { articles: [ {titre, id, date, mois, auteurs:[{nom,pays}], langue,
+                  citations, mots_cles:[], pays:[]}, ... ] }
+   ─────────────────────────────────────────────────────────────────────── */
+async function fetchArticlesFromAPI(keyword, pays, limit=50){
+  const params = new URLSearchParams({
+    q:      keyword || '',
+    pays:   pays    || '',
+    limit:  limit,
+  });
+  const r = await fetch(`${API_BASE}/api/search?${params}`, {
+    headers: { Accept: 'application/json' }
+  });
+  if(!r.ok) throw new Error(`API ${r.status}: ${r.statusText}`);
+  const data = await r.json();
+  return data.articles || [];
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+   ÉTAPE 3 — Quand API_MODE = true, renderTopArticles() appelle l'API.
+   Le reste du code (affichage, export CSV) ne change pas.
+   ─────────────────────────────────────────────────────────────────────── */
+
+
+/* ══ Init (page unique) ═════════════════════════════════════════════════ */
+async function initApp() {
+  toast('Chargement des données arXiv…', 1800);
+  try {
+    TD = await buildTD();
+  } catch (e) {
+    console.error('Erreur lors du chargement des données', e);
+    TD = TD_FALLBACK;
+    toast('⚠ Erreur de chargement — données de démonstration affichées');
+  }
+
+  MONTH_ORDER  = Object.keys(TD.monthly_kw);
+  ML           = TD.month_labels;
+  MV           = TD.monthly_vol;
+  ACTIVE_MONTH = MONTH_ORDER[0];
+
+  renderStatStrip();
+  initMonthPills();
+  renderCloud(ACTIVE_MONTH);
+  renderEvoSuggestions();
+  renderTopArticles();
+  // Carte : initialiser après que le DOM soit prêt
+  setTimeout(renderMap, 100);
+}
+initApp();
