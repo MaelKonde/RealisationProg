@@ -5,12 +5,10 @@
 ```
 ├── index.html          → structure HTML uniquement
 ├── favicon.svg          → icône du site
-├── css/
-│   └── style.css        → tous les styles (variables, header, hero, cartes, footer, responsive…)
-├── js/
-│   ├── config.js         → 🔌 point de bascule JSON ↔ BDD (à modifier plus tard)
-│   ├── data.js            → données de démonstration (fallback) et constantes (pays, mois, stopwords)
-│   └── app.js               → toute la logique applicative (recherche, filtres, stats, rendu…)
+├── style.css        → tous les styles (variables, header, hero, cartes, footer, responsive…)
+├── config.js         → 🔌 point de bascule JSON ↔ BDD (à modifier plus tard)
+├── data.js            → données de démonstration (fallback) et constantes (pays, mois, stopwords)
+│── app.js               → toute la logique applicative (recherche, filtres, stats, rendu…)
 └── arxiv_<mois>.json    → (à ajouter par vous) fichiers de données mensuels, en mode JSON local
 ```
 
