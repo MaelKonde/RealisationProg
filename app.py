@@ -81,26 +81,40 @@ def mois_to_prefix(mois: str):
     return f"{annee}-{num}"
 
 
-def build_auteurs(conn, id_article):
-    rows = conn.execute(
-        "SELECT nom, pays FROM auteurs WHERE id_article = ?", (id_article,)
-    ).fetchall()
-    par_nom = defaultdict(list)
-    for r in rows:
-        if r["pays"] and r["pays"] not in par_nom[r["nom"]]:
-            par_nom[r["nom"]].append(r["pays"])
-    return [{"nom": nom, "pays": pays} for nom, pays in par_nom.items()]
+def build_auteurs_bulk(conn, ids):
+    """Récupère les auteurs de plusieurs articles en un minimum de requêtes
+    (au lieu d'une requête par article — critique vu la taille de la table,
+    541k articles / 589k lignes d'auteurs).
+    Renvoie {id_article: [{"nom":..., "pays":[...]}, ...]}."""
+    result = {i: defaultdict(list) for i in ids}
+    ids = list(ids)
+    CHUNK = 500
+    for i in range(0, len(ids), CHUNK):
+        batch = ids[i:i + CHUNK]
+        placeholders = ",".join("?" for _ in batch)
+        rows = conn.execute(
+            f"SELECT id_article, nom, pays FROM auteurs WHERE id_article IN ({placeholders})",
+            batch,
+        ).fetchall()
+        for r in rows:
+            par_nom = result[r["id_article"]]
+            if r["pays"] and r["pays"] not in par_nom[r["nom"]]:
+                par_nom[r["nom"]].append(r["pays"])
+    return {
+        i: [{"nom": nom, "pays": pays} for nom, pays in par_nom.items()]
+        for i, par_nom in result.items()
+    }
 
 
-def row_to_article(conn, row):
-    """Reconstruit un article au format attendu par app.js."""
+def row_to_article(row, auteurs):
+    """Reconstruit un article au format attendu par app.js.
+    `auteurs` est déjà résolu (via build_auteurs_bulk), pas de requête ici."""
     index_inverse = {}
     try:
         index_inverse = json.loads(row["index_inverse_compte"] or "{}")
     except (TypeError, json.JSONDecodeError):
         pass
 
-    auteurs = build_auteurs(conn, row["id"])
     pays = sorted({p for a in auteurs for p in a["pays"]})
 
     mots_cles = [
@@ -217,24 +231,37 @@ def debug_schema():
 
 @application.get("/articles")
 def articles_by_month():
-    """GET /articles?mois=fevrier2025 -> utilisée par buildTD() côté front."""
+    """GET /articles?mois=fevrier2025[&limit=3000] -> utilisée par buildTD() côté front.
+    La table contient 500k+ articles au total, donc un mois peut à lui
+    seul en contenir des dizaines de milliers : on plafonne et on trie
+    par citations pour renvoyer les plus pertinents en priorité."""
     mois = request.args.get("mois", "")
     prefix = mois_to_prefix(mois)
     if not prefix:
         return jsonify({"error": f"mois invalide: {mois}"}), 400
+    try:
+        limit = min(int(request.args.get("limit", 3000)), 10000)
+    except ValueError:
+        limit = 3000
 
     connexion = connecter_bdd()
     rows = connexion.execute(
-        "SELECT * FROM articles WHERE date LIKE ?", (f"{prefix}%",)
+        """SELECT * FROM articles WHERE date LIKE ?
+           ORDER BY citations DESC LIMIT ?""",
+        (f"{prefix}%", limit),
     ).fetchall()
-    result = [row_to_article(connexion, r) for r in rows]
+    auteurs_map = build_auteurs_bulk(connexion, [r["id"] for r in rows])
+    result = [row_to_article(r, auteurs_map[r["id"]]) for r in rows]
     connexion.close()
     return jsonify(result)
 
 
 @application.get("/api/search")
 def search():
-    """GET /api/search?q=quantum&pays=FR&limit=50 -> utilisée par renderTopArticles()."""
+    """GET /api/search?q=quantum&pays=FR&limit=50 -> utilisée par renderTopArticles().
+    Pour rester rapide sur une table de 500k+ lignes, on ne cherche que
+    parmi les CANDIDATE_POOL articles les plus cités plutôt que de scanner
+    toute la table (qui provoquerait un timeout)."""
     q = request.args.get("q", "").strip().lower()
     pays_filtre = request.args.get("pays", "").strip().upper()
     try:
@@ -242,27 +269,25 @@ def search():
     except ValueError:
         limit = 50
 
+    CANDIDATE_POOL = 5000
     connexion = connecter_bdd()
-    if pays_filtre:
-        rows = connexion.execute(
-            """SELECT DISTINCT ar.* FROM articles ar
-               JOIN auteurs au ON au.id_article = ar.id
-               WHERE au.pays = ?""",
-            (pays_filtre,),
-        ).fetchall()
-    else:
-        rows = connexion.execute("SELECT * FROM articles").fetchall()
+    rows = connexion.execute(
+        "SELECT * FROM articles ORDER BY citations DESC LIMIT ?", (CANDIDATE_POOL,)
+    ).fetchall()
+    auteurs_map = build_auteurs_bulk(connexion, [r["id"] for r in rows])
+    connexion.close()
 
     articles = []
     for r in rows:
-        a = row_to_article(connexion, r)
+        a = row_to_article(r, auteurs_map[r["id"]])
         if q:
             hay = (a["titre"] or "").lower() + " " + " ".join(a["mots_cles"]).lower()
             if q not in hay:
                 continue
+        if pays_filtre and pays_filtre not in a["pays"]:
+            continue
         articles.append(a)
 
-    connexion.close()
     articles.sort(key=lambda a: a["citations"] or 0, reverse=True)
     return jsonify({"articles": articles[:limit]})
 
