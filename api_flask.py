@@ -1,206 +1,241 @@
 """
-Nom........ : api_flask.py
-Description : Renvoie les données de la base de données par le biais d'une API Flask
+Nom........ : app.py
+Description : API Flask exposant les données de bdd.db (arXiv/OpenAlex)
+              pour le front-end Tendances Scientifiques.
+
+              Contient :
+              - les routes d'origine (liste_articles, liste_auteurs)
+              - les routes attendues par le front-end : /articles?mois=...
+                et /api/search?q=...
+              - le téléchargement automatique de bdd.db depuis Google
+                Drive au démarrage (le fichier est trop lourd pour Git,
+                donc il n'est jamais commité : il est récupéré à chaud).
+
+Usage...... : gunicorn app:application   (en production, sur Render)
+              python3 app.py             (en local, pour tester)
 """
-import sqlite3
+
 import json
+import os
 import re
-from flask import Flask, jsonify, request, send_from_directory
+import sqlite3
+from collections import defaultdict
+
+import gdown
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-application = Flask(__name__)
-CORS(application)  # autorise les appels depuis un frontend sur un autre domaine
+DB_PATH = "bdd.db"
 
-MOIS_FR = {
+# ID extrait de : https://drive.google.com/file/d/120wyznKkDMfXWVANr_f8he4t2AMGhhVX/view
+DRIVE_FILE_ID = "120wyznKkDMfXWVANr_f8he4t2AMGhhVX"
+
+
+def ensure_db():
+    """Télécharge bdd.db depuis Google Drive s'il n'est pas déjà présent
+    (ex: premier démarrage du conteneur Render, disque éphémère)."""
+    if os.path.exists(DB_PATH) and os.path.getsize(DB_PATH) > 0:
+        return
+    print(f"⬇ Téléchargement de {DB_PATH} depuis Google Drive…")
+    gdown.download(id=DRIVE_FILE_ID, output=DB_PATH, quiet=False)
+    if not os.path.exists(DB_PATH):
+        raise RuntimeError("Échec du téléchargement de bdd.db depuis Google Drive")
+    print(f"✓ {DB_PATH} téléchargé ({os.path.getsize(DB_PATH)} octets)")
+
+
+ensure_db()
+
+application = Flask(__name__)
+app = application  # alias, pratique si un outil cherche `app.app`
+CORS(application)  # autorise le front-end (autre domaine) à appeler cette API
+
+# ── Correspondance mois FR -> numéro, pour /articles?mois=... ─────────
+MOIS_NUM = {
     "janvier": "01", "fevrier": "02", "mars": "03", "avril": "04",
     "mai": "05", "juin": "06", "juillet": "07", "aout": "08",
     "septembre": "09", "octobre": "10", "novembre": "11", "decembre": "12",
 }
-MOIS_FR_INV = {v: k for k, v in MOIS_FR.items()}
+
+STOPWORDS_MIN = {
+    "this", "that", "with", "from", "have", "which", "these", "those",
+    "were", "been", "such", "also", "their", "into", "using", "used",
+    "based", "than", "then", "when", "where", "while", "under", "over",
+}
 
 
 def connecter_bdd():
-    connexion = sqlite3.connect("bdd.db")
+    connexion = sqlite3.connect(DB_PATH)
     connexion.row_factory = sqlite3.Row
     return connexion
 
 
-def mois_vers_annee_mois(mois: str):
-    """'fevrier2025' -> '2025-02'  (None si non reconnu)"""
-    m = re.match(r"^([a-z]+)(\d{4})$", mois.strip().lower())
+def mois_to_prefix(mois: str):
+    """'fevrier2025' -> '2025-02' (None si format invalide)."""
+    m = re.match(r"^([a-zéû]+)(\d{4})$", mois.strip().lower())
     if not m:
         return None
-    nom, annee = m.groups()
-    num = MOIS_FR.get(nom)
+    nom, annee = m.group(1), m.group(2)
+    num = MOIS_NUM.get(nom)
     if not num:
         return None
     return f"{annee}-{num}"
 
 
-def date_vers_mois(date_str: str) -> str:
-    """'2025-02-28' -> 'fevrier2025'"""
-    if not date_str or len(date_str) < 7:
-        return ""
-    annee, num = date_str[:4], date_str[5:7]
-    nom = MOIS_FR_INV.get(num, num)
-    return f"{nom}{annee}"
+def build_auteurs(conn, id_article):
+    rows = conn.execute(
+        "SELECT nom, pays FROM auteurs WHERE id_article = ?", (id_article,)
+    ).fetchall()
+    par_nom = defaultdict(list)
+    for r in rows:
+        if r["pays"] and r["pays"] not in par_nom[r["nom"]]:
+            par_nom[r["nom"]].append(r["pays"])
+    return [{"nom": nom, "pays": pays} for nom, pays in par_nom.items()]
 
 
-def recuperer_auteurs(curseur, id_article):
-    curseur.execute("SELECT nom, pays FROM auteurs WHERE id_article = ?", (id_article,))
-    groupes = {}
-    for ligne in curseur.fetchall():
-        groupes.setdefault(ligne["nom"], []).append(ligne["pays"])
-    return [{"nom": nom, "pays": pays} for nom, pays in groupes.items()]
+def row_to_article(conn, row):
+    """Reconstruit un article au format attendu par app.js."""
+    index_inverse = {}
+    try:
+        index_inverse = json.loads(row["index_inverse_compte"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        pass
+
+    auteurs = build_auteurs(conn, row["id"])
+    pays = sorted({p for a in auteurs for p in a["pays"]})
+
+    mots_cles = [
+        w for w, _ in sorted(
+            (
+                (w, c) for w, c in index_inverse.items()
+                if len(w) > 3 and w.lower() not in STOPWORDS_MIN
+            ),
+            key=lambda x: x[1],
+            reverse=True,
+        )[:10]
+    ]
+
+    return {
+        "titre": row["titre"],
+        "id de l'article": row["id"],
+        "id": row["id"],
+        "date": row["date"],
+        "auteurs": auteurs,
+        "language": row["langue"],
+        "langue": row["langue"],
+        "Nombre de citations": row["citations"],
+        "citations": row["citations"],
+        "index_inverse_compte": index_inverse,
+        "mots_cles": mots_cles,
+        "pays": pays,
+    }
 
 
-# ── Anciennes routes (conservées) ──────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+# Routes d'origine
+# ══════════════════════════════════════════════════════════════════════
+
 @application.route("/articles/<int:limite>")
 def liste_articles(limite):
     connexion = connecter_bdd()
     curseur = connexion.cursor()
-    curseur.execute("""
+    curseur.execute(
+        """
         SELECT id, titre, date, langue, citations
         FROM articles
         ORDER BY date DESC
         LIMIT ?
-    """, (limite,))
+        """,
+        (limite,),
+    )
     lignes = curseur.fetchall()
     connexion.close()
+
     articles = [
         {
             "id": ligne["id"],
             "titre": ligne["titre"],
             "date": ligne["date"],
             "langue": ligne["langue"],
-            "citations": ligne["citations"]
+            "citations": ligne["citations"],
         }
         for ligne in lignes
     ]
     return jsonify(articles)
 
 
-@application.route("/auteurs/<id_article>")
+@application.route("/auteurs/<path:id_article>")
 def liste_auteurs(id_article):
     connexion = connecter_bdd()
     curseur = connexion.cursor()
-    curseur.execute("""
-        SELECT nom, pays
-        FROM auteurs
-        WHERE id_article = ?
-    """, (id_article,))
+    curseur.execute(
+        "SELECT nom, pays FROM auteurs WHERE id_article = ?", (id_article,)
+    )
     lignes = curseur.fetchall()
     connexion.close()
+
     auteurs = [{"nom": ligne["nom"], "pays": ligne["pays"]} for ligne in lignes]
     return jsonify(auteurs)
 
 
-# ── Nouvelle route : /articles?mois=fevrier2025 ─────────────────────────────
-# Utilisée par fetchMonthArticles() dans app.js (mode DATA_SOURCE = 'backend')
-# Renvoie le même format brut que les fichiers arxiv_<mois>.json
-@application.route("/articles")
-def articles_par_mois():
+# ══════════════════════════════════════════════════════════════════════
+# Routes attendues par le front-end (app.js / config.js)
+# ══════════════════════════════════════════════════════════════════════
+
+@application.get("/health")
+def health():
+    return jsonify({"status": "ok"})
+
+
+@application.get("/articles")
+def articles_by_month():
+    """GET /articles?mois=fevrier2025 -> utilisée par buildTD() côté front."""
     mois = request.args.get("mois", "")
-    annee_mois = mois_vers_annee_mois(mois)
-    if not annee_mois:
-        return jsonify({"erreur": f"Paramètre 'mois' invalide : '{mois}'"}), 400
+    prefix = mois_to_prefix(mois)
+    if not prefix:
+        return jsonify({"error": f"mois invalide: {mois}"}), 400
 
     connexion = connecter_bdd()
-    curseur = connexion.cursor()
-    curseur2 = connexion.cursor()
-    curseur.execute("""
-        SELECT id, titre, date, langue, citations, index_inverse_compte
-        FROM articles
-        WHERE substr(date, 1, 7) = ?
-    """, (annee_mois,))
-    lignes = curseur.fetchall()
-
-    resultat = []
-    for ligne in lignes:
-        resultat.append({
-            "titre": ligne["titre"],
-            "id de l'article": ligne["id"],
-            "date": ligne["date"],
-            "auteurs": recuperer_auteurs(curseur2, ligne["id"]),
-            "language": ligne["langue"],
-            "Nombre de citations": ligne["citations"],
-            "index_inverse_compte": json.loads(ligne["index_inverse_compte"] or "{}"),
-        })
+    rows = connexion.execute(
+        "SELECT * FROM articles WHERE date LIKE ?", (f"{prefix}%",)
+    ).fetchall()
+    result = [row_to_article(connexion, r) for r in rows]
     connexion.close()
-    return jsonify(resultat)
+    return jsonify(result)
 
 
-# ── Nouvelle route : /api/search?q=...&pays=...&limit=... ──────────────────
-# Utilisée par fetchArticlesFromAPI() dans app.js (recherche live, API_MODE = true)
-# Renvoie { articles: [...] } déjà au format normalisé attendu par l'affichage
-@application.route("/api/search")
-def recherche_articles():
-    mot_cle = request.args.get("q", "").strip().lower()
+@application.get("/api/search")
+def search():
+    """GET /api/search?q=quantum&pays=FR&limit=50 -> utilisée par renderTopArticles()."""
+    q = request.args.get("q", "").strip().lower()
     pays_filtre = request.args.get("pays", "").strip().upper()
-    limite = request.args.get("limit", 50, type=int)
+    try:
+        limit = min(int(request.args.get("limit", 50)), 200)
+    except ValueError:
+        limit = 50
 
     connexion = connecter_bdd()
-    curseur = connexion.cursor()
-    curseur2 = connexion.cursor()
-
     if pays_filtre:
-        curseur.execute("""
-            SELECT DISTINCT a.id, a.titre, a.date, a.langue, a.citations, a.index_inverse_compte
-            FROM articles a
-            JOIN auteurs au ON au.id_article = a.id
-            WHERE au.pays = ?
-            ORDER BY a.citations DESC
-        """, (pays_filtre,))
+        rows = connexion.execute(
+            """SELECT DISTINCT ar.* FROM articles ar
+               JOIN auteurs au ON au.id_article = ar.id
+               WHERE au.pays = ?""",
+            (pays_filtre,),
+        ).fetchall()
     else:
-        curseur.execute("""
-            SELECT id, titre, date, langue, citations, index_inverse_compte
-            FROM articles
-            ORDER BY citations DESC
-        """)
+        rows = connexion.execute("SELECT * FROM articles").fetchall()
 
     articles = []
-    for ligne in curseur.fetchall():
-        kw = json.loads(ligne["index_inverse_compte"] or "{}")
-        titre_lower = (ligne["titre"] or "").lower()
-
-        if mot_cle:
-            match_titre = mot_cle in titre_lower
-            match_mot = any(mot_cle in w.lower() for w in kw.keys())
-            if not (match_titre or match_mot):
+    for r in rows:
+        a = row_to_article(connexion, r)
+        if q:
+            hay = (a["titre"] or "").lower() + " " + " ".join(a["mots_cles"]).lower()
+            if q not in hay:
                 continue
-
-        auteurs = recuperer_auteurs(curseur2, ligne["id"])
-        pays_liste = sorted({p for au in auteurs for p in au["pays"]})
-        mots_tries = sorted(kw.items(), key=lambda x: x[1], reverse=True)[:10]
-
-        articles.append({
-            "titre": ligne["titre"],
-            "id": ligne["id"],
-            "date": ligne["date"],
-            "mois": date_vers_mois(ligne["date"]),
-            "auteurs": auteurs,
-            "langue": ligne["langue"],
-            "citations": ligne["citations"],
-            "mots_cles": [w for w, _ in mots_tries],
-            "pays": pays_liste,
-        })
-
-        if len(articles) >= limite:
-            break
+        articles.append(a)
 
     connexion.close()
-    return jsonify({"articles": articles})
-
-
-# ── Sert le frontend statique ───────────────────────────────────────────────
-@application.route("/")
-def index():
-    return send_from_directory(".", "index.html")
-
-
-@application.route("/<path:filename>")
-def static_files(filename):
-    return send_from_directory(".", filename)
+    articles.sort(key=lambda a: a["citations"] or 0, reverse=True)
+    return jsonify({"articles": articles[:limit]})
 
 
 if __name__ == "__main__":
