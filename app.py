@@ -186,6 +186,35 @@ def health():
     return jsonify({"status": "ok"})
 
 
+# ── TEMPORAIRE : à retirer une fois le bug 500 résolu ──────────────────
+@application.errorhandler(Exception)
+def handle_exception(e):
+    import traceback
+    return jsonify({
+        "error": str(e),
+        "type": type(e).__name__,
+        "traceback": traceback.format_exc(),
+    }), 500
+
+
+@application.get("/debug/schema")
+def debug_schema():
+    """Diagnostic : montre le schéma réel de bdd.db (colonnes, nb de lignes)."""
+    connexion = connecter_bdd()
+    info = {}
+    for table in ("articles", "auteurs"):
+        cols = connexion.execute(f"PRAGMA table_info({table})").fetchall()
+        count = connexion.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
+        info[table] = {
+            "columns": [dict(c) for c in cols],
+            "row_count": count,
+        }
+    sample = connexion.execute("SELECT * FROM articles LIMIT 1").fetchone()
+    info["sample_article"] = dict(sample) if sample else None
+    connexion.close()
+    return jsonify(info)
+
+
 @application.get("/articles")
 def articles_by_month():
     """GET /articles?mois=fevrier2025 -> utilisée par buildTD() côté front."""
