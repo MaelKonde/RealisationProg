@@ -211,6 +211,15 @@ def handle_exception(e):
     }), 500
 
 
+@application.get("/debug/routes")
+def debug_routes():
+    """Diagnostic : liste toutes les routes réellement enregistrées."""
+    return jsonify(sorted([
+        {"rule": str(r), "methods": sorted(r.methods - {"HEAD", "OPTIONS"})}
+        for r in application.url_map.iter_rules()
+    ], key=lambda x: x["rule"]))
+
+
 @application.get("/debug/schema")
 def debug_schema():
     """Diagnostic : montre le schéma réel de bdd.db (colonnes, nb de lignes)."""
