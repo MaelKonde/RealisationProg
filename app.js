@@ -717,8 +717,8 @@ function exportArticlesCSV(){
 
    ÉTAPE 1 — Activer le mode API en changeant cette constante :
    ─────────────────────────────────────────────────────────────────────── */
-const API_MODE = false;  // ← passer à true quand l'API Flask est prête
-const API_BASE = 'http://localhost:5000'; // ← URL de votre API (local ou Render)
+const API_MODE = true;
+const API_BASE = 'https://realisationprog-1.onrender.com';
 
 /* ─────────────────────────────────────────────────────────────────────────
    ÉTAPE 2 — Cette fonction remplace le filtre JS statique par un vrai appel API.
