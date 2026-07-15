@@ -6,21 +6,6 @@
       ajoutés.
    ══════════════════════════════════════════════════════════════════════ */
 const APP_CONFIG = {
-    'arxiv_aout2025.json',
-    'arxiv_avril2025.json',
-    'arxiv_avril2026.json',
-    'arxiv_decembre2025.json',
-    'arxiv_fevrier2025.json',
-    'arxiv_fevrier2026.json',
-    'arxiv_janvier2026.json',
-    'arxiv_juillet2025.json',
-    'arxiv_juin2025.json',
-    'arxiv_juin2026.json',
-    'arxiv_mai2026.json',
-    'arxiv_mars2025.json',
-    'arxiv_mars2026.json',
-    'arxiv_novembre2025.json',
-   
   MONTHS_FILES: [
     'fevrier2025',
     'mars2025',
@@ -37,12 +22,10 @@ const APP_CONFIG = {
     'mai2026',
     'juin2026',
   ],
-
-  // 'json'    : charge les fichiers arxiv_<mois>.json ci-dessus (actif)
-  // 'backend' : interroge l'API Flask + SQLite (à activer plus tard)
-  DATA_SOURCE: 'json',
-
+  // 'json'    : charge les fichiers arxiv_<mois>.json ci-dessus
+  // 'backend' : interroge l'API Flask + SQLite (actif)
+  DATA_SOURCE: 'backend',
   // URL de base de l'API backend (utilisée uniquement si DATA_SOURCE = 'backend')
   // Endpoint attendu : GET {BACKEND_API_URL}/articles?mois=fevrier2026
-  BACKEND_API_URL: 'http://localhost:5000/api',
+  BACKEND_API_URL: 'https://realisationprog-1.onrender.com',
 };
